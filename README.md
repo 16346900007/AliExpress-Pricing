@@ -88,6 +88,12 @@ database/rates-seed.json  运费种子数据（编译进 exe）
 - 前端通信：Tauri 环境走 `invoke` IPC；浏览器环境自动 fallback 到内置 HTTP API（127.0.0.1:18080）
 - 运费数据来源：速卖通官方渠道运费标准 Excel（21 个线路 sheet）
 
+## 商务合作
+
+扫码添加企业微信，申请备注「GITHUB」：
+
+![商务合作](docs/screenshots/wechat-qr.jpg)
+
 ## License
 
 CC BY-NC-ND 4.0 — 不可商用，禁止演绎，署名相同方式共享。
