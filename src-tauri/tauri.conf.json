@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui-opensource/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "AliExpress Pricing",
+  "version": "0.1.1",
+  "identifier": "com.tengyu.ae-pricing",
+  "build": {
+    "beforeDevCommand": "pnpm exec vite --config vite.config.ts",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "pnpm exec vite build --config vite.config.ts",
+    "frontendDist": "../dist/client"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "速卖通定价系统",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 700
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"]
+  }
+}
