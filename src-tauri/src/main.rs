@@ -964,11 +964,138 @@ fn preview_template(state: State<DbState>, id: String, dto: PreviewDto) -> DbRes
     Ok(PreviewResult { template_id: id, template_name: name, weights_g: weights, countries: countries_out })
 }
 
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
+fn start_http_server(db_path: PathBuf) {
+    std::thread::spawn(move || {
+        let listener = match TcpListener::bind("127.0.0.1:18080") {
+            Ok(l) => l,
+            Err(e) => { eprintln!("[http] 18080 端口占用: {}", e); return; }
+        };
+        println!("[http] HTTP API 已启动 http://127.0.0.1:18080");
+        let conn = std::sync::Arc::new(Mutex::new(Connection::open(&db_path).expect("http db open failed")));
+        for stream in listener.incoming() {
+            let mut stream = match stream { Ok(s) => s, Err(_) => continue };
+            let conn = conn.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let n = match stream.read(&mut buf) { Ok(n) => n, Err(_) => return };
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let mut lines = req.lines();
+                let request_line = lines.next().unwrap_or("");
+                let parts: Vec<&str> = request_line.split_whitespace().collect();
+                if parts.len() < 2 { return; }
+                let method = parts[0];
+                let path = parts[1];
+
+                let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                let body = &req[body_start..];
+
+                let result = handle_http(&conn, method, path, body);
+                let (status, json) = match result {
+                    Ok(v) => (200, serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())),
+                    Err(e) => (500, format!("{{\"error\":\"{}\"}}", e.replace('"', "'"))),
+                };
+                let _ = write!(stream, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}", json.len(), json);
+            });
+        }
+    });
+}
+
+fn handle_http(conn: &std::sync::Arc<Mutex<Connection>>, method: &str, path: &str, body: &str) -> Result<serde_json::Value, String> {
+    let c = conn.lock().unwrap();
+    // 路由
+    if method == "GET" && path.starts_with("/api/pricing/lines") {
+        let mut stmt = c.prepare("SELECT DISTINCT line_name, line_category FROM ae_shipping_rate ORDER BY line_category, line_name").map_err(|e| e.to_string())?;
+        let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
+            Ok(serde_json::json!({"lineName": r.get::<_,String>(0)?, "lineCategory": r.get::<_,String>(1)?}))
+        }).map_err(|e| e.to_string())?.filter_map(|x| x.ok()).collect();
+        return Ok(serde_json::Value::Array(rows));
+    }
+    if method == "GET" && path.starts_with("/api/pricing/countries") {
+        let line_name = path.split('?').nth(1).and_then(|q| {
+            q.split('&').find_map(|p| {
+                let kv: Vec<&str> = p.split('=').collect();
+                if kv[0] == "lineName" { Some(kv[1].to_string()) } else { None }
+            })
+        });
+        let sql = match &line_name {
+            Some(_) => "SELECT DISTINCT country_code, country_zh, country_en FROM ae_shipping_rate WHERE line_name=?1 ORDER BY country_zh",
+            None => "SELECT DISTINCT country_code, country_zh, country_en FROM ae_shipping_rate ORDER BY country_zh",
+        };
+        let mut stmt = c.prepare(sql).map_err(|e| e.to_string())?;
+        let rows: Vec<serde_json::Value> = match &line_name {
+            Some(ln) => stmt.query_map([ln], |r| Ok(serde_json::json!({"countryCode": r.get::<_,String>(0)?, "countryZh": r.get::<_,String>(1)?, "countryEn": r.get::<_,String>(2)?}))).map_err(|e| e.to_string())?.filter_map(|x| x.ok()).collect(),
+            None => stmt.query_map([], |r| Ok(serde_json::json!({"countryCode": r.get::<_,String>(0)?, "countryZh": r.get::<_,String>(1)?, "countryEn": r.get::<_,String>(2)?}))).map_err(|e| e.to_string())?.filter_map(|x| x.ok()).collect(),
+        };
+        return Ok(serde_json::Value::Array(rows));
+    }
+    if method == "GET" && path.starts_with("/api/pricing/settings") {
+        let s = get_settings(&c)?;
+        return Ok(serde_json::to_value(&s).map_err(|e| e.to_string())?);
+    }
+    if method == "GET" && path.starts_with("/api/pricing/shipping-rates") {
+        let page: i64 = path.split('?').nth(1).and_then(|q| q.split('&').find_map(|p| {
+            let kv: Vec<&str> = p.split('=').collect();
+            if kv[0] == "page" { kv[1].parse().ok() } else { None }
+        })).unwrap_or(1);
+        let page_size: i64 = path.split('?').nth(1).and_then(|q| q.split('&').find_map(|p| {
+            let kv: Vec<&str> = p.split('=').collect();
+            if kv[0] == "pageSize" { kv[1].parse().ok() } else { None }
+        })).unwrap_or(20);
+        let total: i64 = c.query_row("SELECT COUNT(*) FROM ae_shipping_rate", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let offset = (page - 1) * page_size;
+        let mut stmt = c.prepare("SELECT id, line_name, line_category, goods_type, country_zh, country_en, country_code, currency, weight_min_g, weight_max_g, fee_per_kg, registration_fee, min_charge_g, calc_mode, first_weight_fee, additional_fee_per_500g, tier_label, volume_divisor FROM ae_shipping_rate ORDER BY line_category, line_name, country_zh, weight_min_g LIMIT ?1 OFFSET ?2").map_err(|e| e.to_string())?;
+        let rows: Vec<serde_json::Value> = stmt.query_map(params![page_size, offset], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_,String>(0)?, "lineName": r.get::<_,String>(1)?, "lineCategory": r.get::<_,String>(2)?,
+                "goodsType": r.get::<_,String>(3)?, "countryZh": r.get::<_,String>(4)?, "countryEn": r.get::<_,String>(5)?,
+                "countryCode": r.get::<_,String>(6)?, "currency": r.get::<_,String>(7)?,
+                "weightMinG": r.get::<_,i64>(8)?, "weightMaxG": r.get::<_,i64>(9)?,
+                "feePerKg": r.get::<_,Option<f64>>(10)?, "registrationFee": r.get::<_,Option<f64>>(11)?,
+                "minChargeG": r.get::<_,i64>(12)?, "calcMode": r.get::<_,String>(13)?,
+                "firstWeightFee": r.get::<_,Option<f64>>(14)?, "additionalFeePer500g": r.get::<_,Option<f64>>(15)?,
+                "tierLabel": r.get::<_,Option<String>>(16)?, "volumeDivisor": r.get::<_,i64>(17)?,
+            }))
+        }).map_err(|e| e.to_string())?.filter_map(|x| x.ok()).collect();
+        return Ok(serde_json::json!({"items": rows, "total": total, "page": page, "pageSize": page_size}));
+    }
+    if method == "POST" && path.starts_with("/api/pricing/price") {
+        let dto: PriceCalcDto = serde_json::from_str(body).map_err(|e| e.to_string())?;
+        let s = get_settings(&c)?;
+        let goods = dto.goods_type.clone().unwrap_or_else(|| "普货".into());
+        let tier = find_tier(&c, &dto.line_name, &dto.country_code, &goods, dto.weight_g)?.ok_or("未覆盖")?;
+        let quote = build_freight_quote(&tier, dto.weight_g, s.exchange_rate, dto.dims.triple());
+        let profit = dto.profit_rate.unwrap_or(s.default_profit_rate);
+        let total = round2(dto.product_cost_rmb + quote.freight_rmb);
+        let be = break_even(total, &s)?;
+        let sug = price_with_profit(total, &s, profit)?;
+        return Ok(serde_json::to_value(PriceCalcResult {
+            freight_rmb: quote.freight_rmb, total_cost_rmb: total, break_even_price_usd: be,
+            suggested_price_usd: sug, expected_profit_rmb: expected_profit(sug, total, &s),
+            used_commission_rate: s.commission_rate, used_loss_rate: s.loss_rate,
+            used_profit_rate: profit, used_exchange_rate: s.exchange_rate,
+        }).map_err(|e| e.to_string())?);
+    }
+    if method == "POST" && path.starts_with("/api/pricing/freight") {
+        let dto: FreightQuoteDto = serde_json::from_str(body).map_err(|e| e.to_string())?;
+        let s = get_settings(&c)?;
+        let goods = dto.goods_type.clone().unwrap_or_else(|| "普货".into());
+        let tier = find_tier(&c, &dto.line_name, &dto.country_code, &goods, dto.weight_g)?.ok_or("未覆盖")?;
+        return Ok(serde_json::to_value(build_freight_quote(&tier, dto.weight_g, s.exchange_rate, dto.dims.triple())).map_err(|e| e.to_string())?);
+    }
+    Err(format!("404 {} {}", method, path))
+}
+
 fn main() {
     let db_path = get_db_path();
     let conn = Connection::open(&db_path).expect("无法打开数据库");
     conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
     init_db(&conn).expect("数据库初始化失败");
+
+    start_http_server(db_path);
 
     tauri::Builder::default()
         .manage(DbState { conn: Mutex::new(conn) })

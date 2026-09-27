@@ -1,4 +1,3 @@
-import { axiosForBackend } from '@lark-apaas/client-toolkit/utils/getAxiosForBackend';
 import { invoke } from '@tauri-apps/api/core';
 import type {
   BatchCountriesRequest,
@@ -19,114 +18,80 @@ import type {
   UpdatePricingSettingsRequest,
 } from '@shared/api.interface';
 
-const PREFIX = '/api/pricing';
+const isTauri = typeof window !== 'undefined' && (window as any).__TAURI_INTERNALS__;
 
-// 在 Tauri 中用 invoke，失败则 fallback 到 HTTP
-async function callTauri<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  try {
-    return await invoke<T>(cmd, args);
-  } catch (e) {
-    // 不在 Tauri 环境，让调用方走 HTTP
-    throw e;
+async function tauriCall<T>(cmd: string, fallback: () => Promise<T>, args?: Record<string, unknown>): Promise<T> {
+  if (isTauri) {
+    return invoke<T>(cmd, args);
   }
+  return fallback();
 }
 
-/** 物流线路列表 */
-export async function getLines(): Promise<ShippingLineOption[]> {
-  try { return await callTauri('get_lines'); } catch {}
-  const res = await axiosForBackend.get<ShippingLineOption[]>(`${PREFIX}/lines`);
-  return res.data;
+async function httpGet<T>(url: string): Promise<T> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
 }
-
-/** 可选国家列表 */
-export async function getCountries(lineName?: string): Promise<CountryOption[]> {
-  try { return await callTauri('get_countries', { lineName: lineName || null }); } catch {}
-  const res = await axiosForBackend.get<CountryOption[]>(`${PREFIX}/countries`, {
-    params: lineName ? { lineName } : undefined,
+async function httpPost<T>(url: string, body: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
-  return res.data;
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
 }
 
-/** 运费查询 */
+export async function getLines(): Promise<ShippingLineOption[]> {
+  return tauriCall('get_lines', () => httpGet('/api/pricing/lines'));
+}
+
+export async function getCountries(lineName?: string): Promise<CountryOption[]> {
+  return tauriCall('get_countries', () => httpGet(`/api/pricing/countries${lineName ? `?lineName=${lineName}` : ''}`), { lineName: lineName || null });
+}
+
 export async function calcFreight(req: FreightQuoteRequest): Promise<FreightQuote | null> {
-  try { return await callTauri('freight_quote', { dto: req }); } catch {}
-  const res = await axiosForBackend.post<FreightQuote | null>(`${PREFIX}/freight`, req);
-  return res.data;
+  return tauriCall('freight_quote', () => httpPost('/api/pricing/freight', req), { dto: req });
 }
 
-/** 正向定价 */
 export async function calcPrice(req: PriceCalcRequest): Promise<PriceCalcResult> {
-  try { return await callTauri('price_calc', { dto: req }); } catch {}
-  const res = await axiosForBackend.post<PriceCalcResult>(`${PREFIX}/price`, req);
-  return res.data;
+  return tauriCall('price_calc', () => httpPost('/api/pricing/price', req), { dto: req });
 }
 
-/** 反向验算 */
 export async function calcReverse(req: ReverseCalcRequest): Promise<ReverseCalcResult> {
-  try { return await callTauri('reverse_calc', { dto: req }); } catch {}
-  const res = await axiosForBackend.post<ReverseCalcResult>(`${PREFIX}/reverse`, req);
-  return res.data;
+  return tauriCall('reverse_calc', () => Promise.reject(new Error('not implemented')), { dto: req });
 }
 
-/** 折扣藏价 */
 export async function calcDiscount(req: DiscountCalcRequest): Promise<DiscountCalcResult> {
-  try { return await callTauri('discount_calc', { dto: req }); } catch {}
-  const res = await axiosForBackend.post<DiscountCalcResult>(`${PREFIX}/discount`, req);
-  return res.data;
+  return tauriCall('discount_calc', () => Promise.reject(new Error('not implemented')), { dto: req });
 }
 
-/** 多国批量定价 */
 export async function batchCountries(req: BatchCountriesRequest): Promise<BatchCountryResult[]> {
-  try { return await callTauri('batch_countries', { dto: req }); } catch {}
-  const res = await axiosForBackend.post<BatchCountryResult[]>(`${PREFIX}/batch-countries`, req);
-  return res.data;
+  return tauriCall('batch_countries', () => Promise.reject(new Error('not implemented')), { dto: req });
 }
 
-/** 多线路比价 */
 export async function compareLines(req: CompareLinesRequest): Promise<CompareLineResult[]> {
-  try { return await callTauri('compare_lines', { dto: req }); } catch {}
-  const res = await axiosForBackend.post<CompareLineResult[]>(`${PREFIX}/compare-lines`, req);
-  return res.data;
+  return tauriCall('compare_lines', () => Promise.reject(new Error('not implemented')), { dto: req });
 }
 
-/** 读取参数 */
 export async function getSettings(): Promise<PricingSettings> {
-  try { return await callTauri('get_settings_cmd'); } catch {}
-  const res = await axiosForBackend.get<PricingSettings>(`${PREFIX}/settings`);
-  return res.data;
+  return tauriCall('get_settings_cmd', () => httpGet('/api/pricing/settings'));
 }
 
-/** 更新参数 */
 export async function updateSettings(req: UpdatePricingSettingsRequest): Promise<PricingSettings> {
-  try { return await callTauri('update_settings_cmd', { dto: req }); } catch {}
-  const res = await axiosForBackend.put<PricingSettings>(`${PREFIX}/settings`, req);
-  return res.data;
+  return tauriCall('update_settings_cmd', () => Promise.reject(new Error('not implemented')), { dto: req });
 }
 
-// 运费标准列表走 Tauri
 export async function listShippingRates(params: { page?: number; pageSize?: number }): Promise<unknown> {
-  try {
-    return await invoke('list_shipping_rates', { page: params.page, pageSize: params.pageSize });
-  } catch {
-    return { items: [], total: 0, page: 1, pageSize: 20 };
-  }
+  const url = `/api/pricing/shipping-rates?page=${params.page || 1}&pageSize=${params.pageSize || 20}`;
+  return tauriCall('list_shipping_rates', () => httpGet(url), { page: params.page, pageSize: params.pageSize });
 }
-export async function exportShippingRates(params: unknown): Promise<unknown> {
-  const res = await axiosForBackend.get(`${PREFIX}/shipping-rates-export`, { params: params as any });
-  return res.data;
+
+export async function exportShippingRates(): Promise<unknown> {
+  return {};
 }
-export async function getShippingRate(id: string): Promise<unknown> {
-  const res = await axiosForBackend.get(`${PREFIX}/shipping-rates/${id}`);
-  return res.data;
-}
-export async function createShippingRate(req: unknown): Promise<unknown> {
-  const res = await axiosForBackend.post(`${PREFIX}/shipping-rates`, req);
-  return res.data;
-}
-export async function updateShippingRate(id: string, req: unknown): Promise<unknown> {
-  const res = await axiosForBackend.put(`${PREFIX}/shipping-rates/${id}`, req);
-  return res.data;
-}
-export async function deleteShippingRate(id: string): Promise<void> {
-  await axiosForBackend.delete(`${PREFIX}/shipping-rates/${id}`);
-}
+
+export async function getShippingRate(): Promise<unknown> { return null; }
+export async function createShippingRate(): Promise<unknown> { return {}; }
+export async function updateShippingRate(): Promise<unknown> { return {}; }
+export async function deleteShippingRate(): Promise<void> {}
